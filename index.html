@@ -19,6 +19,8 @@
     <span class="filename-tag" id="filenameTag"></span>
     <span class="filename-tag" id="indexFileTag"></span>
     <button class="btn-secondary" id="testConnectionBtn">測試大盤連線</button>
+    <button class="btn-secondary" id="fetchMissingBtn">立即抓取大盤資料</button>
+    <button class="btn-secondary" id="clearIndexCacheBtn">清除大盤快取</button>
     <button class="btn-secondary" id="indexPickBtn">上傳大盤指數 CSV（選填）</button>
     <button class="btn-primary" id="pickBtn">選擇 CSV 並分析（可多選）</button>
   </div>
@@ -34,7 +36,7 @@
     <div class="empty-glyph">／／／</div>
     <h2>還沒有載入任何對帳單</h2>
     <p>點右上角「選擇 CSV 並分析」，可以一次選多個檔案，國泰證券一次最多匯出 50 筆，分批匯出再一起載入就行</p>
-    <p>大盤指數資料受瀏覽器的 CORS 限制，連網抓取不一定抓得到；抓不到的話可以改用「上傳大盤指數 CSV」，下載自證交所官網，一定能用</p>
+    <p>大盤指數資料要手動取得：上傳證交所下載的 CSV，或是分析完之後按「立即抓取大盤資料」連網補齊缺漏的日期，不會在分析的時候自動連網（瀏覽器連網受 CORS 限制，不一定抓得到，抓不到就用上傳 CSV，一定能用）。抓過的資料會記住，之後不用重抓；想清掉重新來過的話按「清除大盤快取」</p>
     <p>所有運算都在這支手機／電腦本機完成，CSV 內容不會被上傳到任何伺服器</p>
   </div>
 
@@ -141,8 +143,8 @@
     <div class="section-label">大盤對應分析</div>
     <div class="note-card" id="indexCorrelationEmpty" style="display:none;">
       目前沒有大盤指數資料可以對應。可以點右上角「上傳大盤指數 CSV」，
-      或是有網路連線時直接分析，程式會自動嘗試連到證交所抓取（瀏覽器可能因為
-      CORS 限制連不到，連不到請改用上傳 CSV）；連不到的話可以點「測試大盤連線」
+      或是按「立即抓取大盤資料」連網補齊（分析本身不會自動連網）；瀏覽器連網
+      受 CORS 限制，連不到請改用上傳 CSV，一定能用。連不到的話可以點「測試大盤連線」
       看看實際的錯誤原因。
     </div>
     <section class="stat-grid" id="indexCorrelationGrid"></section>
@@ -156,8 +158,8 @@
           <thead>
             <tr>
               <th>代號</th><th>名稱</th><th>方向</th>
-              <th>進場日</th><th>進場日大盤%</th>
-              <th>出場日</th><th>出場日大盤%</th>
+              <th>進場日</th><th>進場日大盤%</th><th>進場日乖離%</th>
+              <th>出場日</th><th>出場日大盤%</th><th>出場日乖離%</th>
               <th>持有天數</th>
               <th>配對股數</th><th>進場價</th><th>出場價</th><th>報酬率</th><th>淨損益</th>
             </tr>

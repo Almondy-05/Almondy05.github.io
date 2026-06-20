@@ -15,6 +15,8 @@ const indexPickBtn = document.getElementById("indexPickBtn");
 const indexFileInput = document.getElementById("indexFileInput");
 const indexFileTag = document.getElementById("indexFileTag");
 const testConnectionBtn = document.getElementById("testConnectionBtn");
+const fetchMissingBtn = document.getElementById("fetchMissingBtn");
+const clearIndexCacheBtn = document.getElementById("clearIndexCacheBtn");
 
 // 大盤指數收盤資料快取，整個分頁存活期間共用：上傳過的 CSV 解析結果跟
 // 連網抓過的資料都存在這裡。頁面一打開就讀回上次存在 localStorage 的內容；
@@ -57,7 +59,16 @@ function statCell(label, value, cls = "neutral", sub = "") {
 
 /* =========================================================
    選擇對帳單 CSV 並分析
+
+   抓取大盤資料改成手動觸發（對齊最新桌面版）：分析永遠只讀取目前快取裡
+   已經有的大盤資料，不會自動連網。缺漏的日期記在 _lastMissingDates，
+   使用者按「立即抓取大盤資料」才會真的連網補齊。
    ========================================================= */
+
+// 記住最近一次成功分析的狀態，給「立即抓取大盤資料」「清除大盤快取」按鈕用：
+// 抓完／清完之後可以直接用同一批交易重新整理畫面，不用使用者重新選一次檔案。
+let _lastAnalysis = null; // { transactions, matched, openPositions, filenames, duplicateCount }
+let _lastMissingDates = [];
 
 pickBtn.addEventListener("click", () => {
   csvFileInput.value = ""; // 確保選同一批檔案也會觸發 change
@@ -103,81 +114,79 @@ async function analyzeFiles(files) {
       return { error: "這些對帳單沒有配對出任何完整交易（可能全部都是還沒平倉的庫存）" };
     }
 
-    const cleanTrades = matched.filter((m) => !m.isSuspectWindow);
-
-    // 大盤指數對應分析：先看快取夠不夠用，缺的日期再嘗試連網補
-    // （瀏覽器可能因為 CORS 被擋，連不上也完全不影響其他分析）
-    const coreDatesSet = new Set();
-    cleanTrades.forEach((m) => { coreDatesSet.add(m.entryDate); coreDatesSet.add(m.exitDate); });
-    const lookaheadDatesSet = new Set();
-    cleanTrades.forEach((m) => {
-      Stats.sellTooEarlyLookaheadDates(m.exitDate).forEach((d) => lookaheadDatesSet.add(d));
-    });
-    const neededDates = [...new Set([...coreDatesSet, ...lookaheadDatesSet])].sort((a, b) => a - b);
-    const missingDates = neededDates.filter((d) => !(d in indexCloseCache));
-
-    let fetchedCount = 0;
-    let fetchError = null;
-    if (missingDates.length) {
-      const { result: fetched, errorMessage } = await IndexData.fetchTaiexRange(missingDates, (done, total) => {
-        if (pickBtn.disabled) {
-          pickBtn.textContent = `分析中…（正在抓取大盤資料 ${done}/${total}，第一次抓會比較久，之後會記住）`;
-        }
-      });
-      fetchError = errorMessage;
-      if (Object.keys(fetched).length) {
-        IndexData.mergeFetchedIntoCache(indexCloseCache, fetched);
-        IndexData.saveIndexCache(indexCloseCache);
-      }
-      fetchedCount = Object.keys(fetched).length;
-    }
-
-    const indexChangeMap = Object.keys(indexCloseCache).length
-      ? IndexData.buildDailyChangeMap(indexCloseCache) : {};
-
-    let coveredCount = 0;
-    coreDatesSet.forEach((d) => { if (indexChangeMap[d]) coveredCount++; });
-
-    const indexCoverage = {
-      "需要天數": coreDatesSet.size,
-      "已涵蓋天數": coveredCount,
-      "本次連網補上天數": fetchedCount,
-      "缺漏天數": coreDatesSet.size - coveredCount,
-      "連線錯誤訊息": fetchError,
-    };
-
-    const summary = Stats.buildSummary(transactions, matched);
-    const rows = Stats.tradesToRows(matched, indexChangeMap);
-    const symbolRows = Stats.buildSymbolSummary(matched);
-    const bestEfficiencyRows = Stats.findBestEfficiencyStocks(symbolRows);
-    const openPositionRows = Stats.buildOpenPositionsRows(openPositions);
-    const capitalSeriesRaw = Capital.dailyCapitalSeries(cleanTrades);
-    const capitalRows = Stats.capitalBreakdownToRows(
-      Capital.dailyCapitalBreakdown(cleanTrades, summary["平均持有天數"])
-    );
-    const monthlyRows = Stats.buildMonthlySummary(matched);
-    const indexCorrelation = Stats.buildIndexCorrelationSummary(matched, indexChangeMap);
-    const benchmarkCurve = Stats.buildBenchmarkCurve(matched, capitalSeriesRaw, indexChangeMap);
-
-    return {
+    _lastAnalysis = {
+      transactions, matched, openPositions,
       filenames: files.map((f) => f.name),
-      duplicate_count: duplicateCount,
-      raw_transaction_count: transactions.length,
-      summary,
-      trades: rows,
-      symbol_summary: symbolRows,
-      best_efficiency_stocks: bestEfficiencyRows,
-      open_positions: openPositionRows,
-      capital_series: capitalRows,
-      monthly_summary: monthlyRows,
-      index_coverage: indexCoverage,
-      index_correlation: indexCorrelation,
-      benchmark_curve: benchmarkCurve,
+      duplicateCount,
     };
+
+    return buildAnalysisPayload();
   } catch (e) {
     console.error(e);
     return { error: e && e.message ? e.message : String(e) };
   }
+}
+
+// 用 _lastAnalysis 記住的交易，搭配目前快取裡的大盤資料，算出完整的畫面資料。
+// 分析、上傳 CSV、手動抓取、清除快取都共用這個函式，確保畫面格式一致。
+// 只讀快取，不連網；順便把缺漏的大盤日期記到 _lastMissingDates。
+function buildAnalysisPayload() {
+  const { transactions, matched, openPositions, filenames, duplicateCount } = _lastAnalysis;
+  const cleanTrades = matched.filter((m) => !m.isSuspectWindow);
+
+  // 需要哪些大盤日期：每筆交易的進出場日，加上賣飛指標的展望天數、乖離率的
+  // 回看天數。缺漏的記下來給「立即抓取大盤資料」按鈕用。
+  const coreDatesSet = new Set();
+  cleanTrades.forEach((m) => { coreDatesSet.add(m.entryDate); coreDatesSet.add(m.exitDate); });
+  const extraDatesSet = new Set();
+  cleanTrades.forEach((m) => {
+    Stats.sellTooEarlyLookaheadDates(m.exitDate).forEach((d) => extraDatesSet.add(d));
+    Stats.biasLookbackDates(m.entryDate).forEach((d) => extraDatesSet.add(d));
+    Stats.biasLookbackDates(m.exitDate).forEach((d) => extraDatesSet.add(d));
+  });
+  const neededDates = [...new Set([...coreDatesSet, ...extraDatesSet])].sort((a, b) => a - b);
+  _lastMissingDates = neededDates.filter((d) => !(d in indexCloseCache));
+
+  const indexChangeMap = Object.keys(indexCloseCache).length
+    ? IndexData.buildDailyChangeMap(indexCloseCache) : {};
+
+  let coveredCount = 0;
+  coreDatesSet.forEach((d) => { if (indexChangeMap[d]) coveredCount++; });
+
+  const indexCoverage = {
+    "需要天數": coreDatesSet.size,
+    "已涵蓋天數": coveredCount,
+    "缺漏天數": coreDatesSet.size - coveredCount,
+  };
+
+  const summary = Stats.buildSummary(transactions, matched);
+  const rows = Stats.tradesToRows(matched, indexChangeMap);
+  const symbolRows = Stats.buildSymbolSummary(matched);
+  const bestEfficiencyRows = Stats.findBestEfficiencyStocks(symbolRows);
+  const openPositionRows = Stats.buildOpenPositionsRows(openPositions);
+  const capitalSeriesRaw = Capital.dailyCapitalSeries(cleanTrades);
+  const capitalRows = Stats.capitalBreakdownToRows(
+    Capital.dailyCapitalBreakdown(cleanTrades, summary["平均持有天數"])
+  );
+  const monthlyRows = Stats.buildMonthlySummary(matched);
+  const indexCorrelation = Stats.buildIndexCorrelationSummary(matched, indexChangeMap);
+  const benchmarkCurve = Stats.buildBenchmarkCurve(matched, capitalSeriesRaw, indexChangeMap);
+
+  return {
+    filenames,
+    duplicate_count: duplicateCount,
+    raw_transaction_count: transactions.length,
+    summary,
+    trades: rows,
+    symbol_summary: symbolRows,
+    best_efficiency_stocks: bestEfficiencyRows,
+    open_positions: openPositionRows,
+    capital_series: capitalRows,
+    monthly_summary: monthlyRows,
+    index_coverage: indexCoverage,
+    index_correlation: indexCorrelation,
+    benchmark_curve: benchmarkCurve,
+  };
 }
 
 /* =========================================================
@@ -240,6 +249,9 @@ indexFileInput.addEventListener("change", async () => {
     const dates = Object.keys(indexCloseCache).map(Number).sort((a, b) => a - b);
     indexFileTag.textContent =
       `大盤資料已載入 ${DateUtil.toISO(dates[0])} → ${DateUtil.toISO(dates[dates.length - 1])}（共 ${dates.length} 天）`;
+
+    // 已經分析過的話，用同一批交易直接重新整理畫面，不用重新選對帳單
+    if (_lastAnalysis) renderResult(buildAnalysisPayload());
   } catch (err) {
     alert("大盤指數 CSV 讀取失敗：" + (err && err.message ? err.message : err));
     console.error(err);
@@ -247,6 +259,81 @@ indexFileInput.addEventListener("change", async () => {
     indexPickBtn.disabled = false;
     indexPickBtn.textContent = "上傳大盤指數 CSV（選填）";
   }
+});
+
+/* =========================================================
+   立即抓取大盤資料（手動連網）/ 清除大盤快取
+   ========================================================= */
+
+fetchMissingBtn.addEventListener("click", async () => {
+  if (!_lastAnalysis) {
+    alert(
+      "請先按「選擇 CSV 並分析」跑一次分析，才知道哪些日期缺大盤資料；" +
+      "如果分析完「大盤對應分析」區塊顯示涵蓋率已經 100%，就代表沒有缺漏需要補了。"
+    );
+    return;
+  }
+  if (!_lastMissingDates.length) {
+    alert("目前沒有已知缺少的大盤資料，不需要連網補齊。");
+    return;
+  }
+
+  fetchMissingBtn.disabled = true;
+  fetchMissingBtn.textContent = "抓取中…";
+  try {
+    const requestedCount = _lastMissingDates.length;
+    const { result: fetched, errorMessage } = await IndexData.fetchTaiexRange(
+      _lastMissingDates,
+      (done, total) => { fetchMissingBtn.textContent = `抓取中…（${done}/${total}）`; }
+    );
+
+    const fetchedForNeeded = _lastMissingDates.filter((d) => d in fetched).length;
+    if (Object.keys(fetched).length) {
+      IndexData.mergeFetchedIntoCache(indexCloseCache, fetched);
+      IndexData.saveIndexCache(indexCloseCache);
+    }
+
+    let msg = `這次抓到 ${fetchedForNeeded} / ${requestedCount} 天需要的大盤資料。`;
+    if (errorMessage) {
+      msg += `\n\n連線中途出了狀況，沒有全部抓完：\n${errorMessage}` +
+        `\n\n瀏覽器版如果一直抓不到，多半是證交所端點擋下跨來源請求（CORS）。改用「上傳大盤指數 CSV」一定能用。`;
+    } else if (fetchedForNeeded < requestedCount) {
+      msg += `\n\n還有 ${requestedCount - fetchedForNeeded} 天沒抓到（可能是假日，證交所本來就沒有資料）。`;
+    }
+    msg += "\n\n已經用同一份對帳單重新整理畫面。";
+    alert(msg);
+
+    renderResult(buildAnalysisPayload());
+
+    const allDates = Object.keys(indexCloseCache).map(Number).sort((a, b) => a - b);
+    if (allDates.length) {
+      indexFileTag.textContent =
+        `大盤資料已載入 ${DateUtil.toISO(allDates[0])} → ${DateUtil.toISO(allDates[allDates.length - 1])}（共 ${allDates.length} 天）`;
+    }
+  } catch (err) {
+    alert("抓取大盤資料時發生錯誤：" + (err && err.message ? err.message : err));
+    console.error(err);
+  } finally {
+    fetchMissingBtn.disabled = false;
+    fetchMissingBtn.textContent = "立即抓取大盤資料";
+  }
+});
+
+clearIndexCacheBtn.addEventListener("click", async () => {
+  if (!confirm(
+    "確定要清除已儲存的大盤指數資料嗎？\n\n清除之後，之前上傳或抓取過的大盤資料都會不見，" +
+    "需要重新上傳或重新抓取。這個動作沒辦法復原。"
+  )) return;
+
+  const clearedDays = Object.keys(indexCloseCache).length;
+  IndexData.clearIndexCache(indexCloseCache);
+  indexFileTag.textContent = "";
+  _lastMissingDates = [];
+
+  // 有分析結果的話一併重新整理，讓「大盤對應分析」立刻顯示成沒有資料
+  if (_lastAnalysis) renderResult(buildAnalysisPayload());
+
+  alert(`已清除 ${clearedDays} 天的大盤資料。可以重新上傳 CSV，或分析完之後按「立即抓取大盤資料」重新取得。`);
 });
 
 /* =========================================================
@@ -298,6 +385,7 @@ function renderResult(data) {
     statCell("勝率", fmt(summary["勝率"], { decimals: 1 }) + "%"),
     statCell("平均持有天數", fmt(summary["平均持有天數"], { decimals: 1 }) + " 天"),
     statCell("獲利因子", summary["獲利因子"] !== null ? fmt(summary["獲利因子"], { decimals: 2 }) : "—"),
+    statCell("單筆期望值", summary["單筆期望值"] !== null ? fmt(summary["單筆期望值"], { showSign: true }) : "—", gainLossClass(summary["單筆期望值"]), "平均每筆交易的損益"),
     statCell("平均獲利", fmt(summary["平均獲利"], { showSign: true }), "gain"),
     statCell("平均虧損", fmt(summary["平均虧損"], { showSign: true }), "loss"),
     statCell("最大單筆獲利", fmt(summary["最大單筆獲利"], { showSign: true }), "gain", summary["最大單筆獲利股名"] || ""),
@@ -320,6 +408,8 @@ function renderResult(data) {
     statCell("年化獲利率（尖峰資金）", summary["年化獲利率_尖峰資金"] !== null ? fmt(summary["年化獲利率_尖峰資金"], { decimals: 1, showSign: true }) + "%" : "—", gainLossClass(summary["年化獲利率_尖峰資金"]), "線性年化，非複利"),
     statCell("資金週轉率", summary["資金週轉率"] !== null ? fmt(summary["資金週轉率"], { decimals: 2 }) + " 次" : "—", "neutral", "雙邊成交額 ÷ 平均在場資金"),
     statCell("凹單率", summary["凹單率"] !== null ? fmt(summary["凹單率"], { decimals: 1 }) + "%" : "—", "neutral", `持有超過平均 ${fmt(summary["平均持有天數"], { decimals: 1 })} 天還沒出場的資金佔比`),
+    statCell("夏普值", summary["夏普值"] !== null ? fmt(summary["夏普值"], { decimals: 3 }) : "—", "neutral", "資金占用日報酬率，未年化"),
+    statCell("索提諾比率", summary["索提諾比率"] !== null ? fmt(summary["索提諾比率"], { decimals: 3 }) : "—", "neutral", "只計入下檔波動，未年化"),
     statCell("交易成本佔成交額比", summary["交易成本佔成交額比"] !== null ? fmt(summary["交易成本佔成交額比"], { decimals: 3 }) + "%" : "—"),
     statCell("手續費＋交易稅合計", fmt(summary["手續費交易稅合計"])),
     statCell("資金占用報酬率（逐筆平均年化）", summary["資金占用報酬率_簡單年化"] !== null ? fmt(summary["資金占用報酬率_簡單年化"], { decimals: 1, showSign: true }) + "%" : "—", gainLossClass(summary["資金占用報酬率_簡單年化"]), "每筆交易單日報酬率取平均後年化"),
@@ -440,18 +530,30 @@ function renderResult(data) {
         "neutral",
         `出場後 ${corr["賣飛門檻天數"] ?? 2} 個交易日內大盤漲超過 ${corr["賣飛門檻漲幅"] ?? 4}%，${corr["有賣飛資料的出場筆數"] || 0} 筆有資料`
       ),
+      statCell(
+        "進場日平均乖離%",
+        corr["進場日平均乖離%"] !== null && corr["進場日平均乖離%"] !== undefined
+          ? fmt(corr["進場日平均乖離%"], { decimals: 2, showSign: true }) + "%" : "—",
+        gainLossClass(corr["進場日平均乖離%"]),
+        `相對 ${corr["乖離均線天數"] ?? 6} 日均線，${corr["有乖離資料的進場筆數"] || 0} 筆有資料`
+      ),
+      statCell(
+        "出場日平均乖離%",
+        corr["出場日平均乖離%"] !== null && corr["出場日平均乖離%"] !== undefined
+          ? fmt(corr["出場日平均乖離%"], { decimals: 2, showSign: true }) + "%" : "—",
+        gainLossClass(corr["出場日平均乖離%"]),
+        `相對 ${corr["乖離均線天數"] ?? 6} 日均線，${corr["有乖離資料的出場筆數"] || 0} 筆有資料`
+      ),
     ];
     indexGrid.innerHTML = corrStats.join("");
 
     let note = `${coverage["已涵蓋天數"]} / ${coverage["需要天數"]} 個交易日有大盤資料`;
-    if (coverage["本次連網補上天數"] > 0) note += `（本次連網補上 ${coverage["本次連網補上天數"]} 天）`;
-    if (coverage["缺漏天數"] > 0) note += `，還缺 ${coverage["缺漏天數"]} 天`;
-    if (coverage["連線錯誤訊息"]) note += `　連線錯誤：${coverage["連線錯誤訊息"]}`;
+    if (coverage["缺漏天數"] > 0) note += `，還缺 ${coverage["缺漏天數"]} 天（可以按上方「立即抓取大盤資料」連網補齊，或上傳大盤指數 CSV）`;
     indexCoverageNote.textContent = note;
   } else {
     indexEmpty.style.display = "block";
     indexGrid.innerHTML = "";
-    indexCoverageNote.textContent = coverage["連線錯誤訊息"] ? `連線錯誤：${coverage["連線錯誤訊息"]}` : "";
+    indexCoverageNote.textContent = "";
   }
 
   // 交易明細
@@ -466,6 +568,12 @@ function renderResult(data) {
     const sellTag = t["賣飛"] === true
       ? `<span class="sell-tag" title="出場後 ${corr["賣飛門檻天數"] ?? 2} 個交易日內，大盤漲超過 ${corr["賣飛門檻漲幅"] ?? 4}%">賣飛</span>`
       : "";
+    const entryBias = t["進場日乖離%"];
+    const exitBias = t["出場日乖離%"];
+    const entryBiasCls = entryBias === null || entryBias === undefined ? "" : (entryBias >= 0 ? "pnl-gain" : "pnl-loss");
+    const exitBiasCls = exitBias === null || exitBias === undefined ? "" : (exitBias >= 0 ? "pnl-gain" : "pnl-loss");
+    const entryBiasText = entryBias === null || entryBias === undefined ? "—" : fmt(entryBias, { decimals: 2, showSign: true }) + "%";
+    const exitBiasText = exitBias === null || exitBias === undefined ? "—" : fmt(exitBias, { decimals: 2, showSign: true }) + "%";
     return `
     <tr>
       <td>${t["股票代號"]}</td>
@@ -473,8 +581,10 @@ function renderResult(data) {
       <td><span class="dir-tag">${t["方向"]}</span></td>
       <td>${t["進場日"]}</td>
       <td class="${entryPctCls}">${entryPctText}</td>
+      <td class="${entryBiasCls}" title="進場日相對 ${corr["乖離均線天數"] ?? 6} 日均線的乖離率">${entryBiasText}</td>
       <td>${t["出場日"]}</td>
       <td class="${exitPctCls}">${exitPctText}${sellTag}</td>
+      <td class="${exitBiasCls}" title="出場日相對 ${corr["乖離均線天數"] ?? 6} 日均線的乖離率">${exitBiasText}</td>
       <td>${t["持有天數"]}</td>
       <td>${fmt(t["配對股數"])}</td>
       <td>${fmt(t["進場價"], { decimals: 2 })}</td>

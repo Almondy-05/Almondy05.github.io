@@ -134,14 +134,23 @@
     return (ratePct * 365) / daysSpan;
   }
 
-  // 資金占用報酬率：逐筆計算後取平均，回傳 [平均單日報酬率, 簡單年化報酬率]
-  function capitalOccupancyReturn(matchedTrades) {
+  // 每筆交易的「資金占用日報酬率」：淨損益 ÷ 占用本金 ÷ 持有天數（當沖同一天
+  // 進出，至少以 1 天計，避免除以零）。這是「資金占用報酬率」這個既有指標的
+  // 原始資料，也是夏普值、索提諾比率的報酬率序列來源，這裡把序列獨立出來，
+  // 避免兩邊各自重算一次。
+  function dailyOccupancyRates(matchedTrades) {
     const rates = [];
     for (const m of matchedTrades) {
       if (m.occupiedCapital <= 0) continue;
-      const days = Math.max(m.holdingDays, 1); // 當沖同一天進出，至少以 1 天計
+      const days = Math.max(m.holdingDays, 1);
       rates.push(m.netPnl / m.occupiedCapital / days);
     }
+    return rates;
+  }
+
+  // 資金占用報酬率：逐筆計算後取平均，回傳 [平均單日報酬率, 簡單年化報酬率]
+  function capitalOccupancyReturn(matchedTrades) {
+    const rates = dailyOccupancyRates(matchedTrades);
     if (!rates.length) return [null, null];
     const avgDailyRate = rates.reduce((s, r) => s + r, 0) / rates.length;
     const simpleAnnualized = avgDailyRate * 365;
@@ -152,6 +161,6 @@
     dailyCapitalSeries, dailyCapitalBreakdown, overheldCapitalRatio,
     timeWeightedAvgCapital, peakCapital, medianCapital, latestCapital,
     turnoverRatio, totalVolume, totalFeesAndTax, returnOnCapital,
-    annualize, capitalOccupancyReturn, median,
+    annualize, capitalOccupancyReturn, dailyOccupancyRates, median,
   };
 })(typeof window !== "undefined" ? window : global);

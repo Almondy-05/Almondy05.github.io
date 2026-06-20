@@ -44,6 +44,71 @@
     return gainPct > SELL_TOO_EARLY_THRESHOLD_PCT;
   }
 
+  // 「乖離率」指標的參數：當天收盤指數相對於最近幾個交易日均線的偏離程度
+  const BIAS_MA_DAYS = 6; // 均線天數（含當天本身），短期乖離率常見的參考天數
+  // 最多往前找幾個日曆天，湊出上面那幾個交易日的均線資料。跟賣飛指標的窗口
+  // 邏輯一樣：正常一週只有 5 個交易日，遇到連假更少，窗口放寬只影響「找不找得到
+  // 足夠的交易日」，湊滿 BIAS_MA_DAYS 天就停，不會把更久以前的資料也算進均線。
+  const BIAS_LOOKBACK_CALENDAR_DAYS = 14;
+
+  function biasLookbackDates(targetDate) {
+    const dates = [];
+    for (let i = 0; i <= BIAS_LOOKBACK_CALENDAR_DAYS; i++) dates.push(targetDate - i);
+    return dates;
+  }
+
+  // 乖離率：當天收盤指數相對於「最近 BIAS_MA_DAYS 個交易日（含當天本身）」均線的
+  // 偏離程度。正值代表指數位於均線之上（偏熱、可能追在相對高點），負值代表位於
+  // 均線之下（偏弱、可能買在相對低點）。
+  //   乖離率 = (當天收盤指數 − N 日均線) ÷ N 日均線 × 100%
+  // 從 targetDate 往前找最近 BIAS_MA_DAYS 個有資料的交易日，湊不滿就回傳 null，
+  // 不用不足的天數硬湊一個不準的均線。
+  function computeBias(targetDate, indexChangeMap) {
+    const targetInfo = indexChangeMap[targetDate];
+    if (!targetInfo) return null;
+
+    const closes = [];
+    for (const d of biasLookbackDates(targetDate)) {
+      const info = indexChangeMap[d];
+      if (info) closes.push(info["收盤指數"]);
+      if (closes.length >= BIAS_MA_DAYS) break;
+    }
+    if (closes.length < BIAS_MA_DAYS) return null;
+
+    const ma = closes.reduce((s, c) => s + c, 0) / closes.length;
+    const targetClose = targetInfo["收盤指數"];
+    return pyRound(((targetClose - ma) / ma) * 100, 2);
+  }
+
+  // 風險調整後報酬：夏普值、索提諾比率。報酬率序列用「資金占用日報酬率」
+  // （淨損益 ÷ 占用本金 ÷ 持有天數，當沖以 1 天計），跟既有的「資金占用報酬率」
+  // 同一套算法。
+  //   夏普值 = 平均日報酬率 ÷ 日報酬率的樣本標準差（分母 N-1）
+  //   索提諾比率 = 平均日報酬率 ÷ 下檔偏差（只計算低於 0 的報酬率，分母用全部
+  //               交易筆數 N，高於 0 的視為沒有下檔風險、貢獻 0）
+  // 無風險利率／最低可接受報酬率都假設為 0。算出來的數字沒有年化，是「每筆交易
+  // 資金占用日報酬率」尺度上的原始比值，只適合同一個人同一套算法自己跟自己比，
+  // 不能跟財經報導常見的年化夏普值直接比較。
+  // 交易筆數少於 2 筆（樣本標準差算不出來）、或下檔偏差剛好是 0（整段期間沒有
+  // 任何一筆日報酬率為負）都回傳 null，不硬湊無意義的數字。
+  function riskAdjustedReturns(cleanTrades) {
+    const rates = Capital.dailyOccupancyRates(cleanTrades);
+    const n = rates.length;
+    if (n < 2) return { "夏普值": null, "索提諾比率": null, "樣本數": n };
+
+    const meanRate = rates.reduce((s, r) => s + r, 0) / n;
+    const variance = rates.reduce((s, r) => s + (r - meanRate) ** 2, 0) / (n - 1);
+    const stdDev = variance > 0 ? Math.sqrt(variance) : 0.0;
+
+    const downsideSqSum = rates.reduce((s, r) => s + Math.min(0.0, r) ** 2, 0);
+    const downsideDeviation = Math.sqrt(downsideSqSum / n);
+
+    const sharpe = stdDev > 0 ? pyRound(meanRate / stdDev, 3) : null;
+    const sortino = downsideDeviation > 0 ? pyRound(meanRate / downsideDeviation, 3) : null;
+
+    return { "夏普值": sharpe, "索提諾比率": sortino, "樣本數": n };
+  }
+
   function buildSummary(transactions, matchedTrades) {
     const cleanTrades = matchedTrades.filter((m) => !m.isSuspectWindow);
     const suspectTrades = matchedTrades.filter((m) => m.isSuspectWindow);
@@ -67,6 +132,7 @@
     const lossSum = losses.reduce((s, m) => s + m.netPnl, 0);
     const winSum = wins.reduce((s, m) => s + m.netPnl, 0);
     const profitFactor = (losses.length && lossSum !== 0) ? winSum / Math.abs(lossSum) : null;
+    const expectedValue = totalTrades ? realizedPnl / totalTrades : null;
 
     const bestTrade = cleanTrades.length
       ? cleanTrades.reduce((a, b) => (b.netPnl > a.netPnl ? b : a)) : null;
@@ -81,6 +147,7 @@
 
     const turnover = Capital.turnoverRatio(transactions, avgCapital);
     const [avgDailyRate, simpleAnnualized] = Capital.capitalOccupancyReturn(cleanTrades);
+    const riskAdjusted = riskAdjustedReturns(cleanTrades);
 
     const overheldRatio = Capital.overheldCapitalRatio(
       Capital.dailyCapitalBreakdown(cleanTrades, avgHoldingDays)
@@ -108,6 +175,7 @@
       "平均獲利": pyRound(avgWin, 0),
       "平均虧損": pyRound(avgLoss, 0),
       "獲利因子": profitFactor !== null ? pyRound(profitFactor, 2) : null,
+      "單筆期望值": expectedValue !== null ? pyRound(expectedValue, 0) : null,
       "最大單筆獲利": bestTrade ? pyRound(bestTrade.netPnl, 0) : null,
       "最大單筆獲利股名": bestTrade ? bestTrade.stockName : null,
       "最大單筆虧損": worstTrade ? pyRound(worstTrade.netPnl, 0) : null,
@@ -124,6 +192,8 @@
       "交易成本佔成交額比": costRatio !== null ? pyRound(costRatio, 3) : null,
       "資金週轉率": turnover !== null ? pyRound(turnover, 2) : null,
       "凹單率": overheldRatio !== null ? pyRound(overheldRatio, 1) : null,
+      "夏普值": riskAdjusted["夏普值"],
+      "索提諾比率": riskAdjusted["索提諾比率"],
 
       "資金占用報酬率_平均單日": avgDailyRate !== null ? pyRound(avgDailyRate * 100, 3) : null,
       "資金占用報酬率_簡單年化": simpleAnnualized !== null ? pyRound(simpleAnnualized * 100, 1) : null,
@@ -251,6 +321,9 @@
     const knownSellFlags = sellFlags.filter((f) => f !== null);
     const sellTooEarlyCount = knownSellFlags.filter((f) => f === true).length;
 
+    const entryBias = cleanTrades.map((m) => computeBias(m.entryDate, indexChangeMap)).filter((b) => b !== null && b !== undefined);
+    const exitBias = cleanTrades.map((m) => computeBias(m.exitDate, indexChangeMap)).filter((b) => b !== null && b !== undefined);
+
     return {
       "完整配對交易總筆數": cleanTrades.length,
       "有大盤資料的進場筆數": entryPcts.length,
@@ -269,6 +342,13 @@
         ? pyRound((sellTooEarlyCount / knownSellFlags.length) * 100, 1) : null,
       "賣飛門檻天數": SELL_TOO_EARLY_TRADING_DAYS,
       "賣飛門檻漲幅": SELL_TOO_EARLY_THRESHOLD_PCT,
+      "有乖離資料的進場筆數": entryBias.length,
+      "有乖離資料的出場筆數": exitBias.length,
+      "進場日平均乖離%": entryBias.length
+        ? pyRound(entryBias.reduce((s, b) => s + b, 0) / entryBias.length, 2) : null,
+      "出場日平均乖離%": exitBias.length
+        ? pyRound(exitBias.reduce((s, b) => s + b, 0) / exitBias.length, 2) : null,
+      "乖離均線天數": BIAS_MA_DAYS,
     };
   }
 
@@ -347,13 +427,17 @@
       "進場日大盤漲跌%": pct(m.entryDate),
       "出場日大盤漲跌%": pct(m.exitDate),
       "賣飛": computeSellTooEarly(m.exitDate, indexChangeMap),
+      "進場日乖離%": computeBias(m.entryDate, indexChangeMap),
+      "出場日乖離%": computeBias(m.exitDate, indexChangeMap),
     }));
   }
 
   global.Stats = {
     pyRound,
     SELL_TOO_EARLY_TRADING_DAYS, SELL_TOO_EARLY_LOOKAHEAD_CALENDAR_DAYS, SELL_TOO_EARLY_THRESHOLD_PCT,
+    BIAS_MA_DAYS, BIAS_LOOKBACK_CALENDAR_DAYS,
     sellTooEarlyLookaheadDates, computeSellTooEarly,
+    biasLookbackDates, computeBias, riskAdjustedReturns,
     buildSummary, buildSymbolSummary, findBestEfficiencyStocks,
     buildOpenPositionsRows, capitalSeriesToRows, capitalBreakdownToRows,
     buildIndexCorrelationSummary, buildBenchmarkCurve, buildMonthlySummary,
