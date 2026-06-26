@@ -1,0 +1,654 @@
+/* =========================================================
+   設計系統
+   主題：交易終端機 / 結算戰報
+   - 深色底，數字用等寬字體呈現精準、可比對的質感
+   - 嚴格遵守台股慣例：紅色＝獲利／上漲，綠色＝虧損／下跌
+     （跟美股相反，這點對台灣使用者來說不能搞錯）
+   - 不依賴任何外部字型或 CDN，全部使用 Windows 內建字體，
+     確保離線打包成 exe 之後，沒有網路也能正常顯示
+   ========================================================= */
+
+:root {
+  --ink: #0b0e14;
+  --panel: #141822;
+  --panel-raised: #1a2029;
+  --hairline: #262b38;
+  --text-primary: #e8eaed;
+  --text-muted: #8a92a3;
+  --text-dim: #5b6275;
+
+  --gain: #ff4d5e;       /* 獲利／上漲：紅 */
+  --gain-soft: rgba(255, 77, 94, 0.12);
+  --loss: #2ed573;       /* 虧損／下跌：綠 */
+  --loss-soft: rgba(46, 213, 115, 0.12);
+  --accent: #d4a24e;     /* 琥珀強調色，用於品牌與圖表主線 */
+  --accent-soft: rgba(212, 162, 78, 0.14);
+
+  --font-display: "Consolas", "Cascadia Mono", "Microsoft JhengHei", monospace;
+  --font-body: "Microsoft JhengHei", "PingFang TC", "Noto Sans TC", sans-serif;
+
+  --radius: 6px;
+
+  /* 固定頁首（.app-header）的大概高度，表格標題列浮動時用這個當 top 偏移，
+     讓浮動的標題列剛好接在頁首底下。頁首改高度的話這裡要一起調 */
+  --header-h: 61px;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--ink);
+  color: var(--text-primary);
+  font-family: var(--font-body);
+  -webkit-font-smoothing: antialiased;
+}
+
+body {
+  min-height: 100vh;
+  background-image:
+    radial-gradient(circle at 15% -10%, rgba(212, 162, 78, 0.06), transparent 40%);
+}
+
+/* ---------- Header ---------- */
+
+.app-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 18px 28px;
+  border-bottom: 1px solid var(--hairline);
+  position: sticky;
+  top: 0;
+  background: rgba(11, 14, 20, 0.92);
+  backdrop-filter: blur(6px);
+  z-index: 10;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.brand-mark {
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+  background: var(--accent);
+  box-shadow: 0 0 10px var(--accent-soft);
+}
+
+.brand-name {
+  font-family: var(--font-display);
+  font-size: 16px;
+  letter-spacing: 0.04em;
+  font-weight: 600;
+}
+
+.brand-sub {
+  color: var(--text-dim);
+  font-size: 12px;
+  margin-left: 4px;
+}
+
+.version-tag {
+  color: var(--text-dim);
+  font-size: 10px;
+  font-family: var(--font-display);
+  margin-left: 10px;
+  opacity: 0.6;
+  letter-spacing: 0.05em;
+}
+
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.filename-tag {
+  font-family: var(--font-display);
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.btn-primary {
+  font-family: var(--font-body);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+  background: var(--accent);
+  border: none;
+  border-radius: var(--radius);
+  padding: 10px 18px;
+  cursor: pointer;
+  transition: filter 0.15s ease, transform 0.1s ease;
+}
+
+.btn-primary:hover { filter: brightness(1.08); }
+.btn-primary:active { transform: translateY(1px); }
+.btn-primary:disabled { opacity: 0.5; cursor: default; }
+
+.btn-secondary {
+  font-family: var(--font-body);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-muted);
+  background: transparent;
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius);
+  padding: 9px 16px;
+  cursor: pointer;
+  transition: border-color 0.15s ease, color 0.15s ease;
+}
+
+.btn-secondary:hover { border-color: var(--accent); color: var(--accent); }
+.btn-secondary:disabled { opacity: 0.5; cursor: default; }
+
+/* ---------- Layout ---------- */
+
+main {
+  max-width: 1680px;
+  margin: 0 auto;
+  padding: 28px;
+}
+
+.empty-state {
+  text-align: center;
+  padding: 120px 20px;
+  color: var(--text-dim);
+}
+
+.empty-state .empty-glyph {
+  font-family: var(--font-display);
+  font-size: 13px;
+  letter-spacing: 0.1em;
+  color: var(--accent);
+  margin-bottom: 10px;
+}
+
+.empty-state h2 {
+  color: var(--text-muted);
+  font-weight: 500;
+  font-size: 16px;
+  margin: 0 0 6px;
+}
+
+.empty-state p {
+  font-size: 13px;
+  margin: 0;
+}
+
+/* ---------- Suspect window banner ---------- */
+
+.suspect-banner {
+  border: 1px solid rgba(212, 162, 78, 0.4);
+  background: var(--accent-soft);
+  border-radius: var(--radius);
+  padding: 12px 18px;
+  margin-bottom: 16px;
+  font-size: 12.5px;
+  color: var(--text-primary);
+  line-height: 1.6;
+}
+
+.suspect-banner b { color: var(--accent); }
+
+.suspect-tag {
+  font-size: 10.5px;
+  padding: 1px 6px;
+  margin-left: 6px;
+  border-radius: 3px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  border: 1px solid rgba(212, 162, 78, 0.35);
+}
+
+.sell-tag {
+  font-size: 10.5px;
+  padding: 1px 6px;
+  margin-left: 6px;
+  border-radius: 3px;
+  background: var(--gain-soft);
+  color: var(--gain);
+  border: 1px solid rgba(255, 77, 94, 0.35);
+}
+
+/* ---------- Hero ---------- */
+
+.hero-card {
+  border: 1px solid var(--hairline);
+  background: var(--panel);
+  border-radius: var(--radius);
+  padding: 24px 28px;
+  margin-bottom: 16px;
+}
+
+.hero-label {
+  font-size: 12px;
+  color: var(--text-muted);
+  letter-spacing: 0.06em;
+}
+
+.hero-number {
+  font-family: var(--font-display);
+  font-size: 44px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  margin-top: 6px;
+}
+
+.hero-number.gain { color: var(--gain); }
+.hero-number.loss { color: var(--loss); }
+
+.hero-meta {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+/* ---------- AI 點評卡片 ---------- */
+/* 用一條琥珀色左邊框跟淡淡的強調底色，跟其他統計卡片區隔開，
+   視覺上暗示「這是一段需要閱讀的判讀文字」而不是一堆數字 */
+.commentary-card {
+  border: 1px solid var(--hairline);
+  border-left: 3px solid var(--accent);
+  background: linear-gradient(180deg, var(--accent-soft), transparent 60%), var(--panel);
+  border-radius: var(--radius);
+  padding: 18px 22px;
+  margin-bottom: 16px;
+}
+
+.commentary-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+}
+
+.commentary-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--accent);
+  letter-spacing: 1px;
+}
+
+.commentary-actions {
+  display: flex;
+  gap: 8px;
+}
+
+/* 小型按鈕：設定金鑰、用 AI 深入點評 */
+.mini-btn {
+  font-family: var(--font-body);
+  font-size: 12px;
+  padding: 5px 12px;
+  border: 1px solid var(--hairline);
+  background: transparent;
+  color: var(--text-muted);
+  border-radius: var(--radius);
+  cursor: pointer;
+  transition: border-color 0.15s, color 0.15s;
+}
+.mini-btn:hover { border-color: var(--accent); color: var(--accent); }
+.mini-btn:disabled { opacity: 0.5; cursor: default; }
+
+/* 點評本文：行高放寬一點、限制最大寬度，閱讀起來舒服。每段之間留白。
+   約 1/4 頁面的空間由內容自然撐開，不寫死高度，避免內容多的時候被截斷 */
+.commentary-body {
+  font-size: 13.5px;
+  line-height: 1.85;
+  color: var(--text-primary);
+}
+.commentary-body p { margin: 0 0 10px 0; }
+.commentary-body p:last-child { margin-bottom: 0; }
+.commentary-body .cm-sub-label { color: var(--accent); font-weight: 600; }
+.commentary-body .cm-disclaimer { color: var(--text-dim); font-size: 12px; }
+
+.commentary-mode-tag {
+  margin-top: 10px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+/* 點評載入中的閃爍提示 */
+.commentary-loading { color: var(--text-muted); font-size: 13px; }
+
+/* ---------- Stat grid ---------- */
+
+.stat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 1px;
+  background: var(--hairline);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius);
+  overflow: hidden;
+  margin-bottom: 16px;
+}
+
+.stat-cell {
+  background: var(--panel);
+  padding: 16px 18px;
+}
+
+.stat-cell .label {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+
+.stat-cell .value {
+  font-family: var(--font-display);
+  font-size: 20px;
+  font-weight: 600;
+}
+
+.stat-cell .sub {
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-top: 4px;
+}
+
+.value.gain { color: var(--gain); }
+.value.loss { color: var(--loss); }
+.value.neutral { color: var(--text-primary); }
+
+/* ---------- Section labels & two-column rows ---------- */
+
+.section-label {
+  font-size: 12px;
+  color: var(--text-muted);
+  letter-spacing: 0.05em;
+  margin: 28px 0 10px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.section-label::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--hairline);
+}
+
+.section-label:first-child { margin-top: 0; }
+
+.split-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  margin-bottom: 16px;
+  align-items: start;
+}
+
+.split-row.uneven {
+  grid-template-columns: 1.4fr 1fr;
+}
+
+@media (max-width: 980px) {
+  .split-row, .split-row.uneven { grid-template-columns: 1fr; }
+}
+
+/* ---------- Equity curve ---------- */
+
+.curve-card {
+  border: 1px solid var(--hairline);
+  background: var(--panel);
+  border-radius: var(--radius);
+  padding: 20px 24px 8px;
+  margin-bottom: 16px;
+}
+
+.curve-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 8px;
+}
+
+.curve-title {
+  font-size: 13px;
+  color: var(--text-muted);
+  letter-spacing: 0.03em;
+}
+
+.curve-title b {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.curve-legend {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  font-size: 11.5px;
+  color: var(--text-muted);
+  font-family: var(--font-display);
+  margin: -4px 0 10px;
+  flex-wrap: wrap;
+}
+
+.curve-legend .swatch {
+  display: inline-block;
+  width: 12px;
+  height: 2px;
+  margin-right: 5px;
+  vertical-align: middle;
+  background: currentColor;
+}
+
+.curve-legend .swatch.dashed {
+  background: none;
+  border-top: 2px dashed;
+  height: 0;
+}
+
+#equityCanvas, #capitalCanvas, #freqCanvas, #monthlyPnlCanvas {
+  width: 100%;
+  height: 220px;
+  display: block;
+}
+
+#equityCanvas, #capitalCanvas {
+  cursor: crosshair;
+}
+
+/* ---------- Capital efficiency note cards (footnote-style, used sparingly) ---------- */
+
+.note-card {
+  border: 1px solid var(--hairline);
+  background: var(--panel);
+  border-radius: var(--radius);
+  padding: 14px 18px;
+  margin-bottom: 16px;
+  font-size: 12px;
+  color: var(--text-dim);
+  line-height: 1.6;
+}
+
+/* ---------- Trades table ---------- */
+
+.table-card {
+  border: 1px solid var(--hairline);
+  background: var(--panel);
+  border-radius: var(--radius);
+  /* clip-path 取代 overflow:hidden：視覺效果一樣（裁掉圓角外的內容），
+     但不會建立 sticky container，position:sticky 可以穿透它相對整個頁面運作。
+     overflow:hidden 會讓 sticky 只黏在這張卡片內，捲過卡片就消失，
+     所以不能用 overflow:hidden。 */
+  clip-path: inset(0 round var(--radius));
+}
+
+.table-header {
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--hairline);
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--font-display);
+  font-size: 12.5px;
+}
+
+thead th {
+  text-align: right;
+  padding: 10px 16px;
+  color: var(--text-dim);
+  font-weight: 500;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  border-bottom: 1px solid var(--hairline);
+  white-space: nowrap;
+}
+
+/* 浮動標題列複本（由 app.js 的 setupStickyHeaders 動態建立、掛在 body 底下）。
+   position:fixed 固定在視窗、不在表格卡片裡，所以不受卡片的 clip-path 影響。
+   背景補卡片底色，避免底下的數字透上來。z-index 比頁首（10）低一點。
+   預設 display:none，JS 只在標題列捲出畫面時才顯示。 */
+.sticky-thead-clone {
+  position: fixed;
+  z-index: 9;
+  margin: 0;
+  display: none;
+  pointer-events: none;
+  border-collapse: collapse;
+  background: var(--panel);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
+}
+
+thead th:first-child,
+thead th:nth-child(2),
+thead th:nth-child(3) { text-align: left; }
+
+tbody td {
+  text-align: right;
+  padding: 9px 16px;
+  border-bottom: 1px solid rgba(38, 43, 56, 0.6);
+  white-space: nowrap;
+}
+
+tbody td:first-child,
+tbody td:nth-child(2),
+tbody td:nth-child(3) { text-align: left; font-family: var(--font-body); }
+
+/* 有些表格只有「代號、名稱」兩欄文字，第三欄開始就是數字，要把對齊規則改回來 */
+table.text-cols-2 thead th:nth-child(3) { text-align: right; }
+table.text-cols-2 tbody td:nth-child(3) { text-align: right; font-family: var(--font-display); }
+
+tbody tr:hover { background: var(--panel-raised); }
+
+tbody tr.total-row td {
+  border-top: 1px solid var(--hairline);
+  border-bottom: none;
+  font-weight: 600;
+  color: var(--accent);
+}
+
+td.pnl-gain { color: var(--gain); }
+td.pnl-loss { color: var(--loss); }
+
+/* ---------- Open position percentage cell ---------- */
+
+.pct-cell {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 5px;
+}
+
+.pct-value {
+  font-variant-numeric: tabular-nums;
+}
+
+.pct-bar {
+  width: 64px;
+  height: 4px;
+  background: var(--hairline);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.pct-bar-fill {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  border-radius: 2px;
+}
+
+.dir-tag {
+  font-size: 11px;
+  padding: 2px 7px;
+  border-radius: 3px;
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: var(--ink); }
+::-webkit-scrollbar-thumb { background: var(--hairline); border-radius: 5px; }
+
+/* ---------- Footer ---------- */
+
+.app-footer {
+  text-align: center;
+  font-size: 11px;
+  color: var(--text-dim);
+  padding: 8px 16px 36px;
+}
+
+/* ---------- 手機版響應式調整 ---------- */
+
+@media (max-width: 640px) {
+  .app-header {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 14px 16px;
+  }
+
+  .header-actions {
+    width: 100%;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .header-actions .btn-primary,
+  .header-actions .btn-secondary {
+    flex: 1 1 auto;
+    text-align: center;
+    padding: 11px 14px; /* 觸控目標稍微加大 */
+  }
+
+  .filename-tag {
+    width: 100%;
+    font-size: 11px;
+    white-space: normal;
+    line-height: 1.5;
+  }
+
+  main { padding: 16px; }
+
+  .empty-state { padding: 64px 12px; }
+
+  .hero-card { padding: 18px 18px; }
+  .hero-number { font-size: 32px; }
+
+  .stat-grid { grid-template-columns: repeat(2, 1fr); }
+  .stat-cell { padding: 12px 14px; }
+  .stat-cell .value { font-size: 17px; }
+
+  table { font-size: 11.5px; }
+  thead th, tbody td { padding: 8px 10px; }
+
+  .section-label { margin: 22px 0 8px; }
+
+  /* 手機上表格可橫向捲動，浮動標題列複本在窄螢幕容易對不齊，直接停用 */
+  .sticky-thead-clone { display: none !important; }
+}
